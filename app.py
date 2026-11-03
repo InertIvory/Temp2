@@ -64,6 +64,41 @@ def river_parts(geometry):
             yield from river_parts(item)
 
 
+def river_name(feature):
+    props = feature.get("properties", {})
+    return props.get("name") or props.get("NAME") or props.get("name_en") or props.get("NAME_EN")
+
+
+def make_river_map(feature, name):
+    fig = go.Figure()
+    lon_values, lat_values = [], []
+    parts = list(river_parts(feature.get("geometry")))
+    for part in parts:
+        for point in part:
+            if len(point) >= 2:
+                lon_values.append(point[0])
+                lat_values.append(point[1])
+        lon_values.append(None)
+        lat_values.append(None)
+
+    fig.add_trace(go.Scattergeo(
+        lon=lon_values, lat=lat_values, mode="lines",
+        line=dict(width=3, color="#20b8e6"),
+        name=name,
+        hovertemplate=f"<b>{name}</b><extra>Generalized river geometry</extra>",
+    ))
+    fig.update_geos(
+        projection_type="natural earth",
+        showland=True, landcolor="#e5e1d5",
+        showocean=True, oceancolor="#c7dce5",
+        showcountries=True, countrycolor="#657782",
+        showcoastlines=True, coastlinecolor="#657782",
+        showframe=False,
+    )
+    fig.update_layout(height=560, margin=dict(l=0, r=0, t=5, b=0))
+    return fig
+
+
 def build_map(countries, rivers, selected_name, show_rivers, show_labels,
               projection, map_theme):
     features = countries.get("features", [])
@@ -172,47 +207,43 @@ def build_map(countries, rivers, selected_name, show_rivers, show_labels,
 
 @st.cache_data(ttl=604800, show_spinner="Sampling terrain elevation…")
 def get_elevation_grid(lat_min, lat_max, lon_min, lon_max, resolution):
-    """Fetch one small elevation grid and retry temporary API rate limits."""
+    """Fetch one <=100-point elevation grid; retry temporary rate limits."""
     latitudes = np.linspace(lat_min, lat_max, resolution)
     longitudes = np.linspace(lon_min, lon_max, resolution)
     lon_grid, lat_grid = np.meshgrid(longitudes, latitudes)
-    flat_lats = lat_grid.ravel()
-    flat_lons = lon_grid.ravel()
+    flat_lats, flat_lons = lat_grid.ravel(), lon_grid.ravel()
 
     if len(flat_lats) > 100:
-        raise ValueError("Choose a lower terrain detail: the public elevation API accepts at most 100 locations per request.")
+        raise ValueError("Choose terrain detail of 10 or lower (maximum 100 points).")
 
     params = {
         "latitude": ",".join(f"{v:.5f}" for v in flat_lats),
         "longitude": ",".join(f"{v:.5f}" for v in flat_lons),
     }
-
     with requests.Session() as session:
         for attempt in range(4):
             response = session.get(ELEVATION_URL, params=params, timeout=60)
             if response.status_code == 429 or response.status_code in (500, 502, 503, 504):
                 if attempt == 3:
                     response.raise_for_status()
-                retry_after = response.headers.get("Retry-After")
+                retry = response.headers.get("Retry-After")
                 try:
-                    wait_seconds = float(retry_after) if retry_after else 3 * (2 ** attempt)
+                    delay = float(retry) if retry else 3 * (2 ** attempt)
                 except ValueError:
-                    wait_seconds = 3 * (2 ** attempt)
-                time.sleep(min(max(wait_seconds, 2), 30))
+                    delay = 3 * (2 ** attempt)
+                time.sleep(min(max(delay, 2), 30))
                 continue
-
             response.raise_for_status()
             payload = response.json()
             if "elevation" not in payload:
-                raise ValueError(payload.get("reason", "Elevation service returned no elevation array."))
+                raise ValueError(payload.get("reason", "No elevation array returned."))
             values = payload["elevation"]
             if len(values) != len(flat_lats):
-                raise ValueError(f"Expected {len(flat_lats)} elevation values, received {len(values)}.")
+                raise ValueError(f"Expected {len(flat_lats)} values, received {len(values)}.")
             z = np.asarray(values, dtype=float).reshape(resolution, resolution)
             z[~np.isfinite(z)] = np.nan
             return longitudes, latitudes, z
-
-    raise RuntimeError("Elevation service remained rate-limited after retries.")
+    raise RuntimeError("Elevation API remained rate-limited after retries.")
 
 
 PRESETS = {
@@ -270,7 +301,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-tab_globe, tab_terrain = st.tabs(["🌐 World globe", "⛰️ Terrain explorer"])
+tab_globe, tab_terrain, tab_hydrology = st.tabs(["🌐 World globe", "⛰️ Terrain explorer", "💧 Hydrology"])
 
 with tab_globe:
     with st.sidebar:
@@ -391,7 +422,7 @@ with tab_terrain:
 
     c4, c5, c6 = st.columns(3)
     with c4:
-        resolution = st.select_slider("Terrain detail", options=[5, 7, 9, 10], value=9, help="The public elevation service is rate-limited. This grid is limited to 100 sample points per render.")
+        resolution = st.select_slider("Terrain detail", options=[5, 7, 9, 10], value=9, help="Maximum 100 sample points per terrain request.")
     with c5:
         exaggeration = st.slider("Vertical exaggeration", 1.0, 5.0, 2.0, 0.5)
     with c6:
@@ -447,14 +478,76 @@ with tab_terrain:
     with st.expander("How the terrain layer works"):
         st.markdown("""
         - Elevation is sampled from the **Copernicus DEM GLO-90**, a global digital elevation model.
-        - The source dataset has a nominal 90-metre grid, but this app samples a much coarser display grid (up to 10 × 10 points) to keep the surface responsive and avoid bursts against the public elevation endpoint.
-        - Each terrain grid uses up to 10 × 10 sample locations (100 points) and is sent as one API request. Temporary rate limits are retried with exponential backoff.
+        - The source dataset has a nominal 90-metre grid, but this app samples a much coarser display grid to keep the interactive 3D surface responsive.
+        - Each terrain grid uses up to 10 × 10 sample locations (100 points) in one request. Temporary rate limits are retried with backoff.
         - The 3D surface is a regional terrain view, not a full-resolution survey model. Fine ridges, cliffs and small valleys may be smoothed or missed.
         - Vertical exaggeration is a visual aid and must not be mistaken for true slope or height proportions.
         """)
 
+
+with tab_hydrology:
+    st.subheader("Explore Earth's river network")
+    st.write("Search named river features in the Natural Earth global river dataset.")
+    try:
+        river_features = load_geojson(RIVERS_URL).get("features", [])
+        river_index = {}
+        for feature in river_features:
+            name = river_name(feature)
+            if name:
+                river_index.setdefault(name, feature)
+
+        names = sorted(river_index, key=str.casefold)
+        if not names:
+            st.warning("No named rivers were found in the current dataset.")
+        else:
+            query = st.text_input("Search rivers", placeholder="Nile, Amazon, Congo, Danube…")
+            matches = [n for n in names if query.casefold() in n.casefold()]
+            if not matches:
+                st.info("No matching rivers. Try a shorter search.")
+            else:
+                default = next((n for n in matches if n.casefold() in
+                                {"nile", "amazon", "congo", "orange", "limpopo"}), matches[0])
+                selected = st.selectbox("Select a river", matches, index=matches.index(default))
+                feature = river_index[selected]
+                props = feature.get("properties", {})
+                parts = list(river_parts(feature.get("geometry")))
+                vertices = sum(len(part) for part in parts)
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Named river features", f"{len(names):,}")
+                m2.metric("Geometry parts", f"{len(parts):,}")
+                m3.metric("Mapped vertices", f"{vertices:,}")
+                st.plotly_chart(
+                    make_river_map(feature, selected),
+                    use_container_width=True,
+                    config={"scrollZoom": True, "displaylogo": False, "responsive": True},
+                )
+                st.markdown("#### Attributes supplied by Natural Earth")
+                populated = {str(k): v for k, v in props.items()
+                             if v not in (None, "", [], {})}
+                if populated:
+                    st.json(populated, expanded=False)
+                else:
+                    st.caption("No additional populated attributes for this feature.")
+                st.info(
+                    "Data limitation: this is generalized Natural Earth 1:110m cartographic "
+                    "river linework. It does not reliably provide river source/mouth locations, "
+                    "flow direction, discharge, precise river lengths or complete country crossings. "
+                    "The displayed line is a map geometry, not a verified flow path."
+                )
+    except Exception as exc:
+        st.error("The river explorer could not load its geographic data.")
+        st.code(str(exc))
+
+    with st.expander("Next hydrology data upgrades"):
+        st.markdown("""
+        - **HydroRIVERS:** denser river reaches, reach lengths, river order,
+          upstream/downstream distances, estimated long-term discharge and basin IDs.
+        - **HydroBASINS:** hierarchical watershed and sub-basin boundaries.
+        - **Lake polygons:** major natural lakes and reservoirs.
+        - **River profiles:** verified source/outlet information and flow direction where available.
+        """)
+
 st.divider()
 st.caption(
-    "Terra Atlas • Version 0.2 • Streamlit + Plotly + Natural Earth + Copernicus DEM via Open-Meteo. "
-    "Elevation data attribution: Copernicus Programme and Open-Meteo."
+    "Terra Atlas • Version 0.3 • Streamlit + Plotly + Natural Earth river linework + Copernicus DEM via Open-Meteo."
 )
